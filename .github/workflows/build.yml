@@ -1,0 +1,73 @@
+name: Build mfsBSD (FreeBSD 15.1)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'mfsbsd-*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: FreeBSD 15.1 / ${{ matrix.arch }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, aarch64, riscv64, powerpc64le]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get upstream mfsBSD source
+        run: |
+          git clone --depth 1 https://github.com/mmatuska/mfsbsd.git upstream-mfsbsd
+          git -C upstream-mfsbsd rev-parse HEAD | tee upstream-commit.txt
+
+      - name: Apply architecture-specific packaging changes
+        run: python3 ci/patch_mfsbsd.py "${{ matrix.arch }}" upstream-mfsbsd
+
+      - name: Build using FreeBSD 15.1 tools
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '15.1'
+          arch: x86_64
+          mem: 6144
+          cpu: 2
+          sync: rsync
+          usesh: true
+          run: |
+            /bin/sh ci/build-mfsbsd.sh "${{ matrix.arch }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mfsbsd-15.1-${{ matrix.arch }}
+          path: output/${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish tag release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/mfsbsd-')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mfsbsd-15.1-*
+          path: dist
+          merge-multiple: true
+      - name: Publish artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "mfsBSD FreeBSD 15.1 - ${GITHUB_REF_NAME}" \
+            --notes "Unverified boot images built from upstream mfsBSD. amd64: BIOS+UEFI IMG and ISO; aarch64/riscv64: UEFI IMG; powerpc64le: filesystem payload TAR only (not a bootable disk image). Test before production use."
