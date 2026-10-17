@@ -2,6 +2,11 @@ name: Build mfsBSD (FreeBSD 15.1)
 
 on:
   workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: Optional SSH public key for root login (password SSH disabled)
+        required: false
+        type: string
   push:
     tags:
       - 'mfsbsd-*'
@@ -12,22 +17,120 @@ permissions:
 jobs:
   build:
     name: FreeBSD 15.1 / ${{ matrix.arch }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, aarch64, riscv64, powerpc64le]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Get upstream mfsBSD source
+      - name: Fetch mfsBSD upstream
         run: |
           git clone --depth 1 https://github.com/mmatuska/mfsbsd.git upstream-mfsbsd
-          git -C upstream-mfsbsd rev-parse HEAD | tee upstream-commit.txt
+          git -C upstream-mfsbsd rev-parse HEAD
 
-      - name: Apply architecture-specific packaging changes
-        run: python3 ci/patch_mfsbsd.py "${{ matrix.arch }}" upstream-mfsbsd
+      - name: Inject optional SSH public key
+        env:
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key || vars.MFSBSD_SSH_PUBLIC_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "$SSH_PUBLIC_KEY" ]]; then
+            if [[ "$SSH_PUBLIC_KEY" == *$'\n'* ]] || [[ ! "$SSH_PUBLIC_KEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[A-Za-z0-9_-]+)[[:space:]]+[A-Za-z0-9+/=]+([[:space:]].*)?$ ]]; then
+              echo 'Invalid SSH public key' >&2
+              exit 1
+            fi
+            printf '%s\n' "$SSH_PUBLIC_KEY" > upstream-mfsbsd/conf/authorized_keys
+          fi
+
+      - name: Patch mfsBSD for target architecture (inline)
+        shell: bash
+        run: |
+          python3 - "${{ matrix.arch }}" upstream-mfsbsd <<'PY'
+          #!/usr/bin/env python3
+          """Adapt upstream mfsBSD's x86-only packaging steps for non-x86 targets.
+
+          This deliberately does NOT build a powerpc64le bootloader. POWER gets a
+          filesystem payload tar, not a bootable ISO/IMG.
+          """
+          import pathlib
+          import sys
+
+          arch, root = sys.argv[1], pathlib.Path(sys.argv[2])
+          if arch not in ('amd64', 'aarch64', 'riscv64', 'powerpc64le'):
+              raise SystemExit('Unsupported architecture: ' + arch)
+          if arch == 'amd64':
+              print('amd64: upstream Makefile and GPT/ISO rules unchanged')
+              raise SystemExit(0)
+
+          mk = root / 'Makefile'
+          text = mk.read_text()
+
+          def replace_once(old, new):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f'Makefile unexpectedly changed: expected 1 match, got {count}: {old[:100]!r}')
+              text = text.replace(old, new)
+
+          # Do not expect the x86-only loader_lua, device.hints or cdboot in non-x86 dist.
+          replace_once('BOOTFILES?=\tdefaults device.hints loader_lua lua', 'BOOTFILES?=\tdefaults lua')
+          replace_once('${_v}${CP} ${_DESTDIR}/boot/cdboot ${WRKDIR}/cdboot/',
+                       '${_v}if [ -f ${_DESTDIR}/boot/cdboot ]; then ${CP} ${_DESTDIR}/boot/cdboot ${WRKDIR}/cdboot/; fi')
+          replace_once('${_v}${CP} ${_DESTDIR}/boot/loader_lua.efi ${WRKDIR}/cdboot/',
+                       '${_v}if [ -f ${_DESTDIR}/boot/loader_lua.efi ]; then '
+                       '${CP} ${_DESTDIR}/boot/loader_lua.efi ${WRKDIR}/cdboot/; '
+                       'elif [ -f ${_DESTDIR}/boot/loader.efi ]; then '
+                       '${CP} ${_DESTDIR}/boot/loader.efi ${WRKDIR}/cdboot/loader_lua.efi; '
+                       'elif [ "${TARGET}" != "powerpc" ]; then '
+                       'echo "Missing FreeBSD EFI loader" >&2; exit 1; fi')
+          replace_once('${_v}${MV} -f ${WRKDIR}/disk/boot/loader_lua ${WRKDIR}/disk/boot/loader',
+                       '${_v}if [ -f ${WRKDIR}/disk/boot/loader_lua ]; then '
+                       '${MV} -f ${WRKDIR}/disk/boot/loader_lua ${WRKDIR}/disk/boot/loader; fi')
+          replace_once('${_v}${CP} -p ${_DESTDIR}/boot/pmbr ${_DESTDIR}/boot/gptboot ${WRKDIR}/boot',
+                       '${_v}echo "Non-x86 target: omit x86 BIOS bootcode"')
+          if arch in ('aarch64', 'riscv64'):
+              fallback = 'BOOTAA64.efi' if arch == 'aarch64' else 'BOOTRISCV64.efi'
+              replace_once('${WRKDIR}/efiroot/EFI/BOOT/BOOTX64.efi',
+                           '${WRKDIR}/efiroot/EFI/BOOT/' + fallback)
+              # The El Torito BIOS boot section is x86-specific. The UEFI-only ISO is
+              # experimental; only an IMG is emitted by this workflow for non-x86.
+              old = ('\t${_v}${MAKEFS} -t cd9660 -o rockridge,label=mfsBSD \\\n'
+                     '\t-o bootimage=i386\\;${WRKDIR}/cdboot/cdboot,no-emul-boot \\\n'
+                     '\t-o bootimage=i386\\;${WRKDIR}/cdboot/efiboot.img,no-emul-boot,platformid=efi \\\n')
+              new = ('\t${_v}${MAKEFS} -t cd9660 -o rockridge,label=mfsBSD \\\n'
+                     '\t-o bootimage=efi\\;${WRKDIR}/cdboot/efiboot.img,no-emul-boot,platformid=efi \\\n')
+              # This source modification only impacts an optional, experimental ISO.
+              if old in text:
+                  text = text.replace(old, new, 1)
+          mk.write_text(text)
+
+          # Replace x86-only GPT boot partition and hardcoded p2/p3 with a dynamic index.
+          gpt = root / 'tools/do_gpt.sh'
+          s = gpt.read_text()
+          start = s.index('gpart create -s gpt ${unit}')
+          end = s.index('\n', s.index('  ${TIME} dd if=${TMPIMG} of=/dev/${unit}p2 bs=128k', start))
+          end = s.index('\nfi', end) + len('\nfi')
+          replacement = '''gpart create -s gpt ${unit}
+          part=1
+          if [ -f "${BOOTDIR}/pmbr" ] && [ -f "${BOOTDIR}/gptboot" ]; then
+            gpart add -t freebsd-boot -l boot -s ${BOOT_SIZE}k ${unit}
+            gpart bootcode -b "${BOOTDIR}/pmbr" -p "${BOOTDIR}/gptboot" -i ${part} ${unit}
+            part=$((part + 1))
+          fi
+          if [ -n "${EFIIMG}" ] && [ -f "${EFIIMG}" ]; then
+            gpart add -t efi -l efi -s ${EFI_SIZE}k ${unit}
+            ${TIME} dd if="${EFIIMG}" of="/dev/${unit}p${part}" bs=128k
+            part=$((part + 1))
+          fi
+          gpart add -t freebsd-ufs -l rootfs ${unit}
+          ${TIME} dd if="${TMPIMG}" of="/dev/${unit}p${part}" bs=128k'''
+          s = s[:start] + replacement + s[end:]
+          gpt.write_text(s)
+          print(f'{arch}: adapted mfsBSD source, GPT partition indices are dynamic')
+          PY
 
       - name: Build using FreeBSD 15.1 tools
         uses: vmactions/freebsd-vm@v1
@@ -39,9 +142,119 @@ jobs:
           sync: rsync
           usesh: true
           run: |
-            /bin/sh ci/build-mfsbsd.sh "${{ matrix.arch }}"
+            #!/bin/sh
+            set -eu
 
-      - name: Upload build artifact
+            arch="${{ matrix.arch }}"
+            version='15.1-RELEASE'
+            release='15.1'
+
+            case "$arch" in
+              amd64)
+                family='amd64'; distarch='amd64'; target='amd64'; targetarch='amd64';;
+              aarch64)
+                family='arm64'; distarch='aarch64'; target='arm64'; targetarch='aarch64';;
+              riscv64)
+                family='riscv'; distarch='riscv64'; target='riscv'; targetarch='riscv64';;
+              powerpc64le)
+                family='powerpc'; distarch='powerpc64le'; target='powerpc'; targetarch='powerpc64le';;
+              *) echo "Unsupported arch $arch" >&2; exit 1;;
+            esac
+
+            # Native FreeBSD amd64 tooling can package another little-endian architecture:
+            # no compiler-generated target code or target package installation is used.
+            [ "$(uname -s)" = 'FreeBSD' ] || exit 1
+            case "$(uname -r)" in 15.1-*) ;; *) echo 'Expected FreeBSD 15.1 host' >&2; exit 1;; esac
+
+            workspace="$(pwd)"
+            src="$workspace/upstream-mfsbsd"
+            dest="$workspace/output/$arch"
+            base="/tmp/mfsbsd-dist-$arch"
+            work="/tmp/mfsbsd-work-$arch"
+            mkdir -p "$dest" "$base" "$work"
+
+            url="https://download.freebsd.org/releases/$family/$distarch/$version"
+            echo "Downloading verified distribution sets from $url"
+            for name in MANIFEST base.txz kernel.txz; do
+              fetch -o "$base/$name" "$url/$name"
+            done
+
+            # FreeBSD distribution MANIFEST is tab-delimited: name, checksum type, digest, ...
+            for name in base.txz kernel.txz; do
+              expected=$(awk -F '\t' -v n="$name" '$1 == n { print $2; exit }' "$base/MANIFEST")
+              case "$expected" in
+                ''|*[!0123456789abcdefABCDEF]*) echo "Bad SHA256 for $name in MANIFEST" >&2; exit 1 ;;
+              esac
+              [ "${#expected}" -eq 64 ] || { echo "Invalid SHA256 for $name" >&2; exit 1; }
+              actual=$(sha256 -q "$base/$name")
+              [ "$actual" = "$expected" ] || { echo "SHA256 mismatch: $name" >&2; exit 1; }
+              echo "SHA256 verified: $name"
+            done
+
+            cd "$src"
+            # Every published artifact gets a random root password hash. Only public-key
+            # SSH is enabled when the workflow input provides a key. Never ship the
+            # upstream mfsBSD sample root password hash.
+            password=$(openssl rand -hex 32)
+            hash=$(printf '%s\n' "$password" | openssl passwd -6 -stdin)
+            unset password
+            locked_hash=$(printf '%s' "$hash" | sed 's/\$/\$\$/g')
+            unset hash
+            # NO_ROOTHACK removes the native-code compilation requirement; NO_PACKAGES
+            # avoids repo differences for riscv64 and powerpc64le. All system binaries
+            # come from official 15.1-RELEASE distribution sets.
+            common="BASE=$base VERSION=$version RELEASE=$version TARGET=$target TARGET_ARCH=$targetarch WRKDIR=$work NO_ROOTHACK=1 NO_PACKAGES=1 MFSROOT_MAXSIZE=2048m"
+
+            if [ "$arch" = powerpc64le ]; then
+              echo 'POWER: only creating a mfsBSD filesystem payload; not pretending it is UEFI bootable'
+              make $common "ROOTPW_HASH=$locked_hash" 'PERMIT_ROOT_LOGIN=prohibit-password' NO_EFIBOOT=1 mfsroot
+              name="mfsbsd-$release-powerpc64le-rootfs.tar"
+              tar -C "$work/disk" -cf "$dest/$name" .
+            else
+              name="mfsbsd-$release-$arch.img"
+              make $common "ROOTPW_HASH=$locked_hash" 'PERMIT_ROOT_LOGIN=prohibit-password' IMAGE="$dest/$name" image
+              # Verify GPT and the architecture-specific fallback EFI loader without
+              # booting or executing target-architecture programs.
+              unit=$(mdconfig -a -t vnode -f "$dest/$name")
+              checkdir=$(mktemp -d /tmp/mfsbsd-efi.XXXXXX)
+              part=$(gpart show -p "$unit" | awk '$4 == "efi" { print $3; exit }')
+              if [ -z "$part" ]; then
+                mdconfig -d -u "$unit"
+                rmdir "$checkdir"
+                echo 'No EFI system partition in resulting image' >&2
+                exit 1
+              fi
+              if ! mount -t msdosfs "/dev/${part}" "$checkdir"; then
+                mdconfig -d -u "$unit"
+                rmdir "$checkdir"
+                exit 1
+              fi
+              case "$arch" in
+                amd64) efiname='BOOTX64.efi' ;;
+                aarch64) efiname='BOOTAA64.efi' ;;
+                riscv64) efiname='BOOTRISCV64.efi' ;;
+              esac
+              if [ ! -s "$checkdir/EFI/BOOT/$efiname" ]; then
+                echo "Missing EFI fallback loader $efiname" >&2
+                umount "$checkdir"
+                mdconfig -d -u "$unit"
+                rmdir "$checkdir"
+                exit 1
+              fi
+              umount "$checkdir"
+              mdconfig -d -u "$unit"
+              rmdir "$checkdir"
+              echo "GPT + EFI fallback loader verified: $efiname"
+              if [ "$arch" = amd64 ]; then
+                make $common "ROOTPW_HASH=$locked_hash" 'PERMIT_ROOT_LOGIN=prohibit-password' ISOIMAGE="$dest/mfsbsd-$release-amd64.iso" iso
+              fi
+            fi
+
+            cd "$dest"
+            sha256 -r ./* > SHA256SUMS
+            ls -lh
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mfsbsd-15.1-${{ matrix.arch }}
@@ -50,24 +263,22 @@ jobs:
           retention-days: 30
 
   release:
-    name: Publish tag release
+    name: Publish tagged build
     needs: build
     if: startsWith(github.ref, 'refs/tags/mfsbsd-')
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download matrix artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: mfsbsd-15.1-*
           path: dist
           merge-multiple: true
-      - name: Publish artifacts
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "mfsBSD FreeBSD 15.1 - ${GITHUB_REF_NAME}" \
-            --notes "Unverified boot images built from upstream mfsBSD. amd64: BIOS+UEFI IMG and ISO; aarch64/riscv64: UEFI IMG; powerpc64le: filesystem payload TAR only (not a bootable disk image). Test before production use."
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "mfsBSD FreeBSD 15.1 - $GITHUB_REF_NAME" \
+            --notes 'Experimental: amd64 BIOS/UEFI IMG+ISO; aarch64/riscv64 UEFI IMG; powerpc64le rootfs TAR only (not bootable). Boot not yet tested.'
